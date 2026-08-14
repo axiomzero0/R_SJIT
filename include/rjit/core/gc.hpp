@@ -108,6 +108,10 @@ public:
 
     static GC& current();
 
+    // Set the stack base for conservative scanning. Called once at
+    // program startup (e.g., from main() or Context constructor).
+    static void set_stack_base(void* base);
+
     // Constructor is public so std::make_unique works. (In a more
     // polished version we'd make this private and friend Context,
     // but that requires also friending std::unique_ptr<GC>::reset(),

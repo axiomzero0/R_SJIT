@@ -18,11 +18,11 @@
 #include <unordered_map>
 #include "rjit/feedback/feedback.hpp"
 #include "rjit/jit/deopt.hpp"
+#include "rjit/jit/jit_code.hpp"
 
 namespace rjit {
 
 class BytecodeFunction;
-class JitCode;
 
 enum class Tier : uint8_t {
     kInterpreter = 0,
@@ -45,6 +45,10 @@ public:
 
     Tier current_tier(BytecodeFunction* fn) const;
 
+    // Get/set the compiled JIT code for a function.
+    JitCode* jit_code(BytecodeFunction* fn) const;
+    void set_jit_code(BytecodeFunction* fn, JitCode* code);
+
     // Thresholds (overridable for testing)
     uint64_t baseline_threshold    = FeedbackEngine::kBaselineThreshold;
     uint64_t specialized_threshold = FeedbackEngine::kSpecializedThreshold;
@@ -58,6 +62,7 @@ private:
     FeedbackEngine& fb_;
     DeoptContext&   deopt_;
     std::unordered_map<BytecodeFunction*, Tier> current_tier_;
+    std::unordered_map<BytecodeFunction*, JitCode*> jit_code_;
 };
 
 }  // namespace rjit

@@ -147,11 +147,7 @@ int run_cli(int argc, char** argv) {
         }
         std::fflush(stdout);
         std::fflush(stderr);
-        // _exit skips static destructors, which crash because the GC's
-        // heap tracking is not yet wired up for cleanup. This is a
-        // known issue and will be fixed when conservative stack scanning
-        // is added.
-        _exit(0);
+        return 0;
     } catch (RJitError const& e) {
         std::fprintf(stderr, "Error: %s\n", e.what());
         std::fflush(stdout);
@@ -161,14 +157,14 @@ int run_cli(int argc, char** argv) {
         std::fflush(stdout);
         return 2;
     }
-    std::fprintf(stderr, "[rjit] normal exit\n");
-    std::fflush(stdout);
-    std::fflush(stderr);
-    _exit(0);
+    return 0;
 }
 
 }  // namespace rjit
 
 int main(int argc, char** argv) {
+    // Record the stack base for GC conservative scanning.
+    // This must be done before any Context is created.
+    rjit::GC::set_stack_base(__builtin_frame_address(0));
     return rjit::run_cli(argc, argv);
 }

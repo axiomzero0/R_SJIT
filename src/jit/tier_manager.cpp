@@ -24,4 +24,13 @@ Tier TierManager::current_tier(BytecodeFunction* fn) const {
     return it != current_tier_.end() ? it->second : Tier::kInterpreter;
 }
 
+JitCode* TierManager::jit_code(BytecodeFunction* fn) const {
+    auto it = jit_code_.find(fn);
+    return it != jit_code_.end() ? it->second : nullptr;
+}
+
+void TierManager::set_jit_code(BytecodeFunction* fn, JitCode* code) {
+    jit_code_[fn] = code;
+}
+
 }  // namespace rjit

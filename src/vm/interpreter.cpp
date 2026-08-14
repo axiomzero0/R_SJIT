@@ -123,7 +123,49 @@ Value Interpreter::execute_with_args(BytecodeFunction* fn, Environment* env, Val
     frame_depth_ = 0;
     reg_sp_ = 0;
 
-    // Bottom frame — written directly to the array, no malloc.
+    // Tier check: if the call count exceeds the baseline threshold,
+    // compile with the baseline JIT and cache the result.
+    uint64_t count = ctx_.feedback().call_count(fn).fetch_add(1, std::memory_order_relaxed);
+    if (count == FeedbackEngine::kBaselineThreshold &&
+        ctx_.tiers().current_tier(fn) == Tier::kInterpreter) {
+        BaselineJIT jit(ctx_);
+        JitCode* code = jit.compile(fn);
+        if (code) {
+            ctx_.tiers().set_jit_code(fn, code);
+            ctx_.tiers().set_current_tier(fn, Tier::kBaseline);
+        }
+    }
+
+    // If JIT code is available, use it.
+    JitCode* jit = ctx_.tiers().jit_code(fn);
+    if (jit && jit->entry) {
+        uint32_t nregs = fn->nregs;
+        Value* regs = &reg_arena_[reg_sp_];
+        reg_sp_ += nregs;
+        std::memset(regs, 0, nregs * sizeof(Value));
+        if (args) {
+            uint32_t n = std::min(nargs, fn->nparams);
+            for (uint32_t i = 0; i < n; ++i) {
+                Value v = args[i];
+                if (RJIT_UNLIKELY(v.is_promise())) v = v.as_promise()->force();
+                regs[i] = v;
+            }
+        }
+        Frame jit_frame;
+        jit_frame.fn = fn;
+        jit_frame.env = env;
+        jit_frame.regs = regs;
+        jit_frame.pc = 0;
+        jit_frame.caller = nullptr;
+        jit_frame.caller_dst = 0;
+        jit_frame.nregs = nregs;
+        jit_frame.from_jit = true;
+        Value result = jit->entry(&jit_frame);
+        reg_sp_ -= nregs;
+        return result;
+    }
+
+    // Interpreter path.
     Frame* bottom = &frame_stack_[0];
     bottom->fn = fn;
     bottom->env = env;
@@ -132,7 +174,6 @@ Value Interpreter::execute_with_args(BytecodeFunction* fn, Environment* env, Val
     bottom->pc = 0;
     bottom->from_jit = false;
 
-    // Allocate registers from the arena — just pointer arithmetic.
     uint32_t nregs = fn->nregs;
     Value* regs = &reg_arena_[reg_sp_];
     reg_sp_ += nregs;
@@ -153,7 +194,6 @@ Value Interpreter::execute_with_args(BytecodeFunction* fn, Environment* env, Val
     frame_depth_ = 1;
     Value result = dispatch_loop(*bottom);
 
-    // No free_regs needed — arena is reset by reg_sp_ = 0 on next call.
     return result;
 }
 
@@ -479,11 +519,12 @@ op_ADD: {
     // Fast path: both real (the hottest case in numeric loops)
     if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         regs[ip->rdest] = Value::real(a.as_real() + b.as_real());
-        // Quickening: rewrite to ADD_REAL_REAL after enough hits.
-        // (Disabled for now — needs a counter to avoid rewriting
-        //  too early. Will enable with type feedback.)
+        // Quickening: after enough hits, rewrite to ADD_REAL_REAL.
+        quicken_observe(*ip, TypeTag::kReal, TypeTag::kReal);
         RJIT_DISPATCH_NEXT();
     }
+    // Record the type observation for quickening.
+    quicken_observe(*ip, a.tag(), b.tag());
     regs[ip->rdest] = add_values(a, b);
     RJIT_DISPATCH_NEXT();
 }
@@ -493,8 +534,10 @@ op_LE: {
     Value const& b = regs[ip->rb];
     if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         regs[ip->rdest] = Value::logical(a.as_real() <= b.as_real() ? 1 : 0);
+        quicken_observe(*ip, TypeTag::kReal, TypeTag::kReal);
         RJIT_DISPATCH_NEXT();
     }
+    quicken_observe(*ip, a.tag(), b.tag());
     regs[ip->rdest] = le_values(a, b);
     RJIT_DISPATCH_NEXT();
 }
@@ -529,8 +572,10 @@ op_SUB: {
     Value const& b = regs[ip->rb];
     if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         regs[ip->rdest] = Value::real(a.as_real() - b.as_real());
+        quicken_observe(*ip, TypeTag::kReal, TypeTag::kReal);
         RJIT_DISPATCH_NEXT();
     }
+    quicken_observe(*ip, a.tag(), b.tag());
     regs[ip->rdest] = sub_values(a, b);
     RJIT_DISPATCH_NEXT();
 }
@@ -540,8 +585,10 @@ op_MUL: {
     Value const& b = regs[ip->rb];
     if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         regs[ip->rdest] = Value::real(a.as_real() * b.as_real());
+        quicken_observe(*ip, TypeTag::kReal, TypeTag::kReal);
         RJIT_DISPATCH_NEXT();
     }
+    quicken_observe(*ip, a.tag(), b.tag());
     regs[ip->rdest] = mul_values(a, b);
     RJIT_DISPATCH_NEXT();
 }
@@ -551,8 +598,10 @@ op_DIV: {
     Value const& b = regs[ip->rb];
     if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         regs[ip->rdest] = Value::real(a.as_real() / b.as_real());
+        quicken_observe(*ip, TypeTag::kReal, TypeTag::kReal);
         RJIT_DISPATCH_NEXT();
     }
+    quicken_observe(*ip, a.tag(), b.tag());
     regs[ip->rdest] = div_values(a, b);
     RJIT_DISPATCH_NEXT();
 }
@@ -562,8 +611,10 @@ op_LT: {
     Value const& b = regs[ip->rb];
     if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         regs[ip->rdest] = Value::logical(a.as_real() < b.as_real() ? 1 : 0);
+        quicken_observe(*ip, TypeTag::kReal, TypeTag::kReal);
         RJIT_DISPATCH_NEXT();
     }
+    quicken_observe(*ip, a.tag(), b.tag());
     regs[ip->rdest] = lt_values(a, b);
     RJIT_DISPATCH_NEXT();
 }
@@ -573,8 +624,10 @@ op_GT: {
     Value const& b = regs[ip->rb];
     if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         regs[ip->rdest] = Value::logical(a.as_real() > b.as_real() ? 1 : 0);
+        quicken_observe(*ip, TypeTag::kReal, TypeTag::kReal);
         RJIT_DISPATCH_NEXT();
     }
+    quicken_observe(*ip, a.tag(), b.tag());
     regs[ip->rdest] = gt_values(a, b);
     RJIT_DISPATCH_NEXT();
 }
@@ -584,8 +637,10 @@ op_GE: {
     Value const& b = regs[ip->rb];
     if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         regs[ip->rdest] = Value::logical(a.as_real() >= b.as_real() ? 1 : 0);
+        quicken_observe(*ip, TypeTag::kReal, TypeTag::kReal);
         RJIT_DISPATCH_NEXT();
     }
+    quicken_observe(*ip, a.tag(), b.tag());
     regs[ip->rdest] = ge_values(a, b);
     RJIT_DISPATCH_NEXT();
 }
@@ -595,8 +650,10 @@ op_EQ: {
     Value const& b = regs[ip->rb];
     if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         regs[ip->rdest] = Value::logical(a.as_real() == b.as_real() ? 1 : 0);
+        quicken_observe(*ip, TypeTag::kReal, TypeTag::kReal);
         RJIT_DISPATCH_NEXT();
     }
+    quicken_observe(*ip, a.tag(), b.tag());
     regs[ip->rdest] = eq_values(a, b);
     RJIT_DISPATCH_NEXT();
 }
@@ -606,8 +663,10 @@ op_NE: {
     Value const& b = regs[ip->rb];
     if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         regs[ip->rdest] = Value::logical(a.as_real() != b.as_real() ? 1 : 0);
+        quicken_observe(*ip, TypeTag::kReal, TypeTag::kReal);
         RJIT_DISPATCH_NEXT();
     }
+    quicken_observe(*ip, a.tag(), b.tag());
     regs[ip->rdest] = ne_values(a, b);
     RJIT_DISPATCH_NEXT();
 }
@@ -852,7 +911,38 @@ op_CALL: {
         BytecodeFunction* callee_fn = c->code();
         Environment* callee_env = c->env();
 
-        // Save current IP position for when we return.
+        // Check if we have JIT-compiled code for this function.
+        // If so, call it directly instead of interpreting.
+        JitCode* jit = ctx_.tiers().jit_code(callee_fn);
+        if (RJIT_UNLIKELY(jit != nullptr && jit->entry != nullptr)) {
+            // Set up a frame for the JIT code.
+            uint32_t callee_nregs = callee_fn->nregs;
+            Value* new_regs = &reg_arena_[reg_sp_];
+            reg_sp_ += callee_nregs;
+            std::memset(new_regs, 0, callee_nregs * sizeof(Value));
+            uint32_t n = std::min(nargs, callee_fn->nparams);
+            for (uint32_t i = 0; i < n; ++i) {
+                Value v = args[i];
+                if (RJIT_UNLIKELY(v.is_promise())) v = v.as_promise()->force();
+                new_regs[i] = v;
+            }
+            // Create a Frame for the JIT entry point.
+            Frame jit_frame;
+            jit_frame.fn = callee_fn;
+            jit_frame.env = callee_env;
+            jit_frame.regs = new_regs;
+            jit_frame.pc = 0;
+            jit_frame.caller = nullptr;
+            jit_frame.caller_dst = 0;
+            jit_frame.nregs = callee_nregs;
+            jit_frame.from_jit = true;
+            Value result = jit->entry(&jit_frame);
+            reg_sp_ -= callee_nregs;
+            regs[ip->rdest] = result;
+            RJIT_DISPATCH_NEXT();
+        }
+
+        // Interpreter path: save current IP, push frame, switch.
         cur_frame->pc = static_cast<uint32_t>(ip - code + 1);
 
         // Grab the next frame slot — just a pointer + counter increment.

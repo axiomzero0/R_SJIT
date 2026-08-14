@@ -59,8 +59,22 @@ Value Interpreter::execute(BytecodeFunction* fn, Environment* env) {
 
 // Frame freelist: reuse allocated frames and register files to avoid
 // malloc/free overhead on every function call.
+//
+// regs_freelist is bucketed by size (rounded up to next power of 2)
+// for O(1) lookup. This avoids the linear scan that was burning
+// cycles in recursive benchmarks.
 static thread_local std::vector<Frame*> frame_freelist;
-static thread_local std::vector<std::pair<Value*, uint32_t>> regs_freelist;
+
+// Bucketed by log2(nregs). Each bucket holds regs of that exact size
+// (rounded up to power of 2). Most functions have <32 registers, so
+// only a few buckets are used.
+static constexpr int REGS_BUCKETS = 16;  // up to 2^15 = 32768 regs
+static thread_local std::vector<Value*> regs_freelist_buckets[REGS_BUCKETS];
+
+static inline int regs_bucket_index(uint32_t nregs) {
+    if (nregs <= 1) return 0;
+    return 32 - __builtin_clz(nregs - 1);  // ceil(log2(nregs))
+}
 
 static Frame* alloc_frame() {
     if (!frame_freelist.empty()) {
@@ -80,20 +94,21 @@ static void free_frame(Frame* f) {
 }
 
 static Value* alloc_regs(uint32_t n) {
-    // Try to find a reused reg file that's big enough.
-    for (auto it = regs_freelist.begin(); it != regs_freelist.end(); ++it) {
-        if (it->second >= n) {
-            Value* regs = it->first;
-            regs_freelist.erase(it);
-            return regs;
-        }
+    int bucket = regs_bucket_index(n);
+    if (bucket < REGS_BUCKETS && !regs_freelist_buckets[bucket].empty()) {
+        Value* regs = regs_freelist_buckets[bucket].back();
+        regs_freelist_buckets[bucket].pop_back();
+        return regs;
     }
-    return static_cast<Value*>(std::aligned_alloc(16, (n * sizeof(Value) + 15) & ~size_t(15)));
+    // Allocate rounded up to the bucket size for reuse.
+    uint32_t alloc_size = 1u << bucket;
+    return static_cast<Value*>(std::aligned_alloc(16, (alloc_size * sizeof(Value) + 15) & ~size_t(15)));
 }
 
 static void free_regs(Value* regs, uint32_t n) {
-    if (regs_freelist.size() < 64) {
-        regs_freelist.push_back({regs, n});
+    int bucket = regs_bucket_index(n);
+    if (bucket < REGS_BUCKETS && regs_freelist_buckets[bucket].size() < 64) {
+        regs_freelist_buckets[bucket].push_back(regs);
     } else {
         std::free(regs);
     }

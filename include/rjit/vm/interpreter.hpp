@@ -72,6 +72,22 @@ private:
     InlineCacheTable    ic_table_;
     FramePool           frame_pool_;
 
+    // Pre-allocated frame stack — raw array, no vector overhead.
+    // CALL just increments frame_depth_ and writes to the next slot.
+    // RETURN decrements frame_depth_. No malloc, no capacity checks,
+    // no pointer chasing. Sized for deep recursion (4096 levels).
+    static constexpr size_t kFrameStackCapacity = 4096;
+    std::unique_ptr<Frame[]> frame_stack_;
+    size_t frame_depth_ = 0;
+
+    // Pre-allocated register arena — a single large array of Values.
+    // CALL bumps reg_sp_ by callee_nregs; RETURN decrements. No malloc,
+    // no freelist, no bucket lookup. Just pointer arithmetic.
+    // 256K Values = 4MB, enough for 4096 frames * 64 regs each.
+    static constexpr size_t kRegArenaSize = 262144;
+    std::unique_ptr<Value[]> reg_arena_;
+    size_t reg_sp_ = 0;
+
     // Dispatch loop. Returns the value left in r0.
     Value dispatch_loop(Frame& frame);
 

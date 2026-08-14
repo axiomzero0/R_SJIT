@@ -115,16 +115,31 @@ static void free_regs(Value* regs, uint32_t n) {
 }
 
 Value Interpreter::execute_with_args(BytecodeFunction* fn, Environment* env, Value* args, uint32_t nargs) {
-    // The dispatch loop is now fully iterative — CALL pushes a frame
-    // and switches to it, RETURN pops and restores the caller. No
-    // C++ recursion for R-level calls. This eliminates the 6x overhead
-    // gap with CPython on recursive benchmarks.
-    Frame* frame = alloc_frame();
-    frame->init(fn, env, call_stack_.empty() ? nullptr : call_stack_.back());
-    uint32_t nregs = fn->nregs;
-    Value* regs = alloc_regs(nregs);
+    // Allocate stacks on first use.
+    if (!frame_stack_) {
+        frame_stack_ = std::make_unique<Frame[]>(kFrameStackCapacity);
+        reg_arena_ = std::make_unique<Value[]>(kRegArenaSize);
+    }
+    frame_depth_ = 0;
+    reg_sp_ = 0;
 
-    for (uint32_t i = 0; i < nregs; ++i) regs[i] = Value::nil();
+    // Bottom frame — written directly to the array, no malloc.
+    Frame* bottom = &frame_stack_[0];
+    bottom->fn = fn;
+    bottom->env = env;
+    bottom->caller = nullptr;
+    bottom->caller_dst = 0;
+    bottom->pc = 0;
+    bottom->from_jit = false;
+
+    // Allocate registers from the arena — just pointer arithmetic.
+    uint32_t nregs = fn->nregs;
+    Value* regs = &reg_arena_[reg_sp_];
+    reg_sp_ += nregs;
+    bottom->regs = regs;
+    bottom->nregs = nregs;
+
+    std::memset(regs, 0, nregs * sizeof(Value));
 
     if (args) {
         uint32_t n = std::min(nargs, fn->nparams);
@@ -135,17 +150,10 @@ Value Interpreter::execute_with_args(BytecodeFunction* fn, Environment* env, Val
         }
     }
 
-    frame->regs = regs;
-    frame->nregs = nregs;
-    frame->caller = nullptr;  // No caller — this is the bottom of the stack
-    frame->caller_dst = 0;
-    call_stack_.push_back(frame);
+    frame_depth_ = 1;
+    Value result = dispatch_loop(*bottom);
 
-    Value result = dispatch_loop(*frame);
-
-    call_stack_.pop_back();
-    free_regs(regs, nregs);
-    free_frame(frame);
+    // No free_regs needed — arena is reset by reg_sp_ = 0 on next call.
     return result;
 }
 
@@ -846,27 +854,30 @@ op_CALL: {
 
         // Save current IP position for when we return.
         cur_frame->pc = static_cast<uint32_t>(ip - code + 1);
-        cur_frame->nregs = nregs;
 
-        // Fast frame allocation: reuse a pre-allocated frame from the
-        // frame stack if possible. This avoids malloc on every call.
-        uint32_t callee_nregs = callee_fn->nregs;
-        Frame* new_frame = alloc_frame();
+        // Grab the next frame slot — just a pointer + counter increment.
+        Frame* new_frame = &frame_stack_[frame_depth_++];
         new_frame->fn = callee_fn;
         new_frame->env = callee_env;
         new_frame->caller = cur_frame;
         new_frame->caller_dst = ip->rdest;
+        new_frame->pc = 0;
+        new_frame->from_jit = false;
+
+        // Allocate registers from the arena — just pointer arithmetic.
+        uint32_t callee_nregs = callee_fn->nregs;
+        Value* new_regs = &reg_arena_[reg_sp_];
+        reg_sp_ += callee_nregs;
+        new_frame->regs = new_regs;
         new_frame->nregs = callee_nregs;
 
-        // Fast register allocation: try the exact-size bucket first.
-        Value* new_regs = alloc_regs(callee_nregs);
-        new_frame->regs = new_regs;
-
-        // Zero only the registers we'll use (nregs, not the bucket size).
-        // Using memset is faster than a loop for small arrays.
-        std::memset(new_regs, 0, callee_nregs * sizeof(Value));
-        // Set all tags to kNil (0) — memset already did this, but be explicit.
-        // Actually memset(0) sets tag to 0 = kNil, which is correct.
+        // Zero ONLY the non-parameter registers. Parameters are
+        // overwritten below, so zeroing them is wasted work.
+        // For fib (1 param, 14 regs), this saves ~7% of the memset.
+        if (callee_nregs > callee_fn->nparams) {
+            std::memset(new_regs + callee_fn->nparams, 0,
+                        (callee_nregs - callee_fn->nparams) * sizeof(Value));
+        }
 
         // Bind arguments.
         uint32_t n = std::min(nargs, callee_fn->nparams);
@@ -875,8 +886,6 @@ op_CALL: {
             if (RJIT_UNLIKELY(v.is_promise())) v = v.as_promise()->force();
             new_regs[i] = v;
         }
-
-        call_stack_.push_back(new_frame);
 
         // Switch to callee — NO recursion, just update locals.
         cur_frame = new_frame;
@@ -906,19 +915,16 @@ op_MAKE_CLOSURE: {
 
 op_RETURN: {
     Value ret_val = regs[ip->ra];
-    // caller_dst is stored on THIS frame (set by CALL), not the caller.
     uint32_t dst = cur_frame->caller_dst;
-    // Pop this frame and restore the caller.
-    call_stack_.pop_back();
-    free_regs(cur_frame->regs, cur_frame->nregs);
-    Frame* caller_frame = cur_frame->caller;
-    free_frame(cur_frame);
+    // Pop registers from the arena — just decrement the stack pointer.
+    reg_sp_ -= cur_frame->nregs;
+    frame_depth_--;
 
+    Frame* caller_frame = cur_frame->caller;
     if (RJIT_UNLIKELY(caller_frame == nullptr)) {
         return ret_val;
     }
 
-    // Restore caller state.
     cur_frame = caller_frame;
     fn = caller_frame->fn;
     code = fn->code.data();
@@ -933,11 +939,10 @@ op_RETURN: {
 op_RETURN_NULL: {
     Value ret_val = Value::nil();
     uint32_t dst = cur_frame->caller_dst;
-    call_stack_.pop_back();
-    free_regs(cur_frame->regs, cur_frame->nregs);
-    Frame* caller_frame = cur_frame->caller;
-    free_frame(cur_frame);
+    reg_sp_ -= cur_frame->nregs;
+    frame_depth_--;
 
+    Frame* caller_frame = cur_frame->caller;
     if (RJIT_UNLIKELY(caller_frame == nullptr)) {
         return ret_val;
     }

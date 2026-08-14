@@ -100,16 +100,31 @@ static void free_regs(Value* regs, uint32_t n) {
 }
 
 Value Interpreter::execute_with_args(BytecodeFunction* fn, Environment* env, Value* args, uint32_t nargs) {
+    // Fast path for closure calls: avoid the overhead of slow_call
+    // by inlining the frame setup directly. This is the hottest
+    // function in recursive benchmarks (fib, fact).
     Frame* frame = alloc_frame();
     frame->init(fn, env, call_stack_.empty() ? nullptr : call_stack_.back());
     uint32_t nregs = fn->nregs;
     Value* regs = alloc_regs(nregs);
+
+    // Zero-initialize registers with a tight loop (faster than std::fill
+    // for small arrays — the compiler vectorizes this).
+    // We only need to zero the tag byte; the bits can be garbage.
+    // But for safety, zero everything.
     for (uint32_t i = 0; i < nregs; ++i) regs[i] = Value::nil();
+
+    // Bind arguments into parameter registers (0..nparams-1).
+    // Skip force_if_promise for non-promise values (the common case).
     if (args) {
-        for (uint32_t i = 0; i < nargs && i < fn->nparams; ++i) {
-            regs[i] = force_if_promise(args[i]);
+        uint32_t n = std::min(nargs, fn->nparams);
+        for (uint32_t i = 0; i < n; ++i) {
+            Value v = args[i];
+            if (RJIT_UNLIKELY(v.is_promise())) v = v.as_promise()->force();
+            regs[i] = v;
         }
     }
+
     frame->regs = regs;
     call_stack_.push_back(frame);
 
@@ -800,8 +815,50 @@ op_CALL: {
     Value callee = regs[ip->ra];
     Value* args = &regs[ip->ra + 1];
     uint32_t nargs = ip->k;
-    Value result = slow_call(callee, args, nargs, env);
-    regs[ip->rdest] = result;
+
+    // Inline the closure fast path to avoid slow_call overhead.
+    // This is critical for recursive functions like fib.
+    if (RJIT_LIKELY(callee.is_closure())) {
+        Closure* c = callee.as_closure();
+        BytecodeFunction* callee_fn = c->code();
+        Environment* callee_env = c->env();
+
+        // Allocate frame and regs from the freelist.
+        Frame* new_frame = alloc_frame();
+        new_frame->init(callee_fn, callee_env, &frame);
+        uint32_t callee_nregs = callee_fn->nregs;
+        Value* new_regs = alloc_regs(callee_nregs);
+
+        // Zero registers.
+        for (uint32_t i = 0; i < callee_nregs; ++i) new_regs[i] = Value::nil();
+
+        // Bind arguments.
+        uint32_t n = std::min(nargs, callee_fn->nparams);
+        for (uint32_t i = 0; i < n; ++i) {
+            Value v = args[i];
+            if (RJIT_UNLIKELY(v.is_promise())) v = v.as_promise()->force();
+            new_regs[i] = v;
+        }
+
+        new_frame->regs = new_regs;
+        call_stack_.push_back(new_frame);
+
+        // Recursive dispatch — save our ip back to frame.pc for deopt.
+        frame.pc = static_cast<uint32_t>(ip - code);
+        Value result = dispatch_loop(*new_frame);
+
+        call_stack_.pop_back();
+        free_regs(new_regs, callee_nregs);
+        free_frame(new_frame);
+
+        regs[ip->rdest] = result;
+    } else if (callee.is_builtin() || callee.is_special()) {
+        regs[ip->rdest] = callee.as_builtin()->impl()(ctx_, args, nargs);
+    } else if (callee.is_nil()) {
+        ctx_.raise_error("attempt to call NULL");
+    } else {
+        ctx_.raise_error("attempt to apply non-function");
+    }
     RJIT_DISPATCH_NEXT();
 }
 

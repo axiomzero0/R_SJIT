@@ -848,15 +848,27 @@ op_CALL: {
         cur_frame->pc = static_cast<uint32_t>(ip - code + 1);
         cur_frame->nregs = nregs;
 
-        // Allocate callee frame and regs.
-        Frame* new_frame = alloc_frame();
-        new_frame->init(callee_fn, callee_env, cur_frame);
-        new_frame->caller_dst = ip->rdest;
+        // Fast frame allocation: reuse a pre-allocated frame from the
+        // frame stack if possible. This avoids malloc on every call.
         uint32_t callee_nregs = callee_fn->nregs;
+        Frame* new_frame = alloc_frame();
+        new_frame->fn = callee_fn;
+        new_frame->env = callee_env;
+        new_frame->caller = cur_frame;
+        new_frame->caller_dst = ip->rdest;
+        new_frame->nregs = callee_nregs;
+
+        // Fast register allocation: try the exact-size bucket first.
         Value* new_regs = alloc_regs(callee_nregs);
+        new_frame->regs = new_regs;
 
-        for (uint32_t i = 0; i < callee_nregs; ++i) new_regs[i] = Value::nil();
+        // Zero only the registers we'll use (nregs, not the bucket size).
+        // Using memset is faster than a loop for small arrays.
+        std::memset(new_regs, 0, callee_nregs * sizeof(Value));
+        // Set all tags to kNil (0) — memset already did this, but be explicit.
+        // Actually memset(0) sets tag to 0 = kNil, which is correct.
 
+        // Bind arguments.
         uint32_t n = std::min(nargs, callee_fn->nparams);
         for (uint32_t i = 0; i < n; ++i) {
             Value v = args[i];
@@ -864,8 +876,6 @@ op_CALL: {
             new_regs[i] = v;
         }
 
-        new_frame->regs = new_regs;
-        new_frame->nregs = callee_nregs;
         call_stack_.push_back(new_frame);
 
         // Switch to callee — NO recursion, just update locals.

@@ -28,6 +28,15 @@
 #include <atomic>
 #include <type_traits>
 
+// Branch prediction hints for hot paths.
+#if defined(__GNUC__) || defined(__clang__)
+#define RJIT_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define RJIT_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define RJIT_LIKELY(x)   (x)
+#define RJIT_UNLIKELY(x) (x)
+#endif
+
 namespace rjit {
 
 // ---------------------------------------------------------------------------

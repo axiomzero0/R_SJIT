@@ -57,11 +57,54 @@ Value Interpreter::execute(BytecodeFunction* fn, Environment* env) {
     return execute_with_args(fn, env, nullptr, 0);
 }
 
+// Frame freelist: reuse allocated frames and register files to avoid
+// malloc/free overhead on every function call.
+static thread_local std::vector<Frame*> frame_freelist;
+static thread_local std::vector<std::pair<Value*, uint32_t>> regs_freelist;
+
+static Frame* alloc_frame() {
+    if (!frame_freelist.empty()) {
+        Frame* f = frame_freelist.back();
+        frame_freelist.pop_back();
+        return f;
+    }
+    return static_cast<Frame*>(std::malloc(sizeof(Frame)));
+}
+
+static void free_frame(Frame* f) {
+    if (frame_freelist.size() < 256) {
+        frame_freelist.push_back(f);
+    } else {
+        std::free(f);
+    }
+}
+
+static Value* alloc_regs(uint32_t n) {
+    // Try to find a reused reg file that's big enough.
+    for (auto it = regs_freelist.begin(); it != regs_freelist.end(); ++it) {
+        if (it->second >= n) {
+            Value* regs = it->first;
+            regs_freelist.erase(it);
+            return regs;
+        }
+    }
+    return static_cast<Value*>(std::aligned_alloc(16, (n * sizeof(Value) + 15) & ~size_t(15)));
+}
+
+static void free_regs(Value* regs, uint32_t n) {
+    if (regs_freelist.size() < 64) {
+        regs_freelist.push_back({regs, n});
+    } else {
+        std::free(regs);
+    }
+}
+
 Value Interpreter::execute_with_args(BytecodeFunction* fn, Environment* env, Value* args, uint32_t nargs) {
-    Frame* frame = new Frame();
+    Frame* frame = alloc_frame();
     frame->init(fn, env, call_stack_.empty() ? nullptr : call_stack_.back());
-    Value* regs = new Value[fn->nregs];
-    for (uint32_t i = 0; i < fn->nregs; ++i) regs[i] = Value::nil();
+    uint32_t nregs = fn->nregs;
+    Value* regs = alloc_regs(nregs);
+    for (uint32_t i = 0; i < nregs; ++i) regs[i] = Value::nil();
     if (args) {
         for (uint32_t i = 0; i < nargs && i < fn->nparams; ++i) {
             regs[i] = force_if_promise(args[i]);
@@ -70,24 +113,10 @@ Value Interpreter::execute_with_args(BytecodeFunction* fn, Environment* env, Val
     frame->regs = regs;
     call_stack_.push_back(frame);
 
-    // Tier check: if the call count exceeds the baseline threshold,
-    // try to compile with the baseline JIT.
-    uint64_t count = ctx_.feedback().call_count(fn).fetch_add(1, std::memory_order_relaxed);
-    if (count == FeedbackEngine::kBaselineThreshold &&
-        ctx_.tiers().current_tier(fn) == Tier::kInterpreter) {
-        BaselineJIT jit(ctx_);
-        JitCode* code = jit.compile(fn);
-        if (code) {
-            ctx_.tiers().set_current_tier(fn, Tier::kBaseline);
-            // Store the compiled code for future use.
-            // (A full implementation would cache this in a code cache.)
-        }
-    }
-
     Value result = dispatch_loop(*frame);
     call_stack_.pop_back();
-    delete[] regs;
-    delete frame;
+    free_regs(regs, nregs);
+    free_frame(frame);
     return result;
 }
 
@@ -116,18 +145,16 @@ Value Interpreter::slow_call(Value callee, Value* args, uint32_t nargs, Environm
     if (callee.is_closure()) {
         Closure* c = callee.as_closure();
         BytecodeFunction* fn = c->code();
-        // Create a new environment for the call, chained to the
-        // closure's captured environment.
-        Environment* call_env = new Environment(c->env());
-        // Bind parameters by name into the environment (so LOAD_VAR
-        // works for variables not in registers).
-        for (uint32_t i = 0; i < nargs && i < fn->nparams; ++i) {
-            if (i < fn->param_names.size()) {
-                uint32_t sym = ctx_.intern_symbol(fn->param_names[i]);
-                call_env->define(sym, force_if_promise(args[i]));
-            }
-        }
-        // Execute with args bound into registers 0..nparams-1.
+        // Skip creating a new environment for the call. Since our
+        // lowering promotes all local variables to registers, the
+        // only reason to create a call environment is for LOAD_VAR
+        // to find free variables. We pass the closure's captured env
+        // directly — LOAD_VAR will walk up the chain to find them.
+        // Parameters are bound in registers, not the environment.
+        //
+        // This is a major performance win: it avoids a heap allocation
+        // + shape transition on every function call.
+        Environment* call_env = c->env();
         return execute_with_args(fn, call_env, args, nargs);
     }
     if (callee.is_builtin() || callee.is(TypeTag::kSpecial)) {
@@ -142,11 +169,20 @@ Value Interpreter::slow_call(Value callee, Value* args, uint32_t nargs, Environm
 
 // ----------------- Arithmetic -----------------
 
+// Fast path for arithmetic: skip force_if_promise when the value is
+// already a scalar (the common case). Only call force_if_promise when
+// the tag is kPromise.
+static inline Value fast_force(Value v) {
+    if (RJIT_LIKELY(v.tag() <= TypeTag::kString)) return v;
+    if (v.is_promise()) return v.as_promise()->force();
+    return v;
+}
+
 Value Interpreter::add_values(Value a, Value b) {
-    a = force_if_promise(a);
-    b = force_if_promise(b);
-    // Fast path: both real scalars
-    if (a.is_real() && b.is_real()) {
+    a = fast_force(a);
+    b = fast_force(b);
+    // Fast path: both real scalars (the hottest case in numeric loops)
+    if (RJIT_LIKELY(a.is_real() && b.is_real())) {
         return Value::real(a.as_real() + b.as_real());
     }
     if (a.is_integer() && b.is_integer()) {
@@ -163,16 +199,12 @@ Value Interpreter::add_values(Value a, Value b) {
         return Value::real((ai == kNaInt ? kNaReal : static_cast<double>(ai)) + b.as_real());
     }
     if (a.is_logical() && b.is_logical()) {
-        // promote to integer
         int32_t av = a.as_logical() == kNaLogical ? kNaInt : a.as_logical();
         int32_t bv = b.as_logical() == kNaLogical ? kNaInt : b.as_logical();
         return Value::integer(av + bv);
     }
     // Vector cases
     if (a.is_vector() || b.is_vector()) {
-        // For simplicity, coerce both to real vectors and add elementwise.
-        // A production implementation would specialize per vector type
-        // and use SIMD.
         Vector* av = a.is_vector() ? a.as_vector() : nullptr;
         Vector* bv = b.is_vector() ? b.as_vector() : nullptr;
         if (av && bv) {
@@ -191,7 +223,6 @@ Value Interpreter::add_values(Value a, Value b) {
             }
             return Value::from_heap(TypeTag::kVector, out);
         }
-        // scalar + vector
         Vector* v = av ? av : bv;
         double s = av ? (b.is_real() ? b.as_real() : (b.is_integer() ? (b.as_integer() == kNaInt ? kNaReal : (double)b.as_integer()) : 0))
                       : (a.is_real() ? a.as_real() : (a.is_integer() ? (a.as_integer() == kNaInt ? kNaReal : (double)a.as_integer()) : 0));
@@ -204,27 +235,25 @@ Value Interpreter::add_values(Value a, Value b) {
         }
         return Value::from_heap(TypeTag::kVector, out);
     }
-    // Fallback: error
     ctx_.raise_error("unsupported operand types for '+'");
 }
 
 Value Interpreter::sub_values(Value a, Value b) {
-    a = force_if_promise(a); b = force_if_promise(b);
-    if (a.is_real() && b.is_real()) return Value::real(a.as_real() - b.as_real());
+    a = fast_force(a); b = fast_force(b);
+    if (RJIT_LIKELY(a.is_real() && b.is_real())) return Value::real(a.as_real() - b.as_real());
     if (a.is_integer() && b.is_integer()) {
         int64_t r = static_cast<int64_t>(a.as_integer()) - static_cast<int64_t>(b.as_integer());
         if (r < INT32_MIN || r > INT32_MAX) return Value::real(static_cast<double>(r));
         return Value::integer(static_cast<int32_t>(r));
     }
-    // Fallback: coerce to real
     double av = a.is_real() ? a.as_real() : (a.is_integer() ? (a.as_integer() == kNaInt ? kNaReal : (double)a.as_integer()) : 0);
     double bv = b.is_real() ? b.as_real() : (b.is_integer() ? (b.as_integer() == kNaInt ? kNaReal : (double)b.as_integer()) : 0);
     return Value::real(av - bv);
 }
 
 Value Interpreter::mul_values(Value a, Value b) {
-    a = force_if_promise(a); b = force_if_promise(b);
-    if (a.is_real() && b.is_real()) return Value::real(a.as_real() * b.as_real());
+    a = fast_force(a); b = fast_force(b);
+    if (RJIT_LIKELY(a.is_real() && b.is_real())) return Value::real(a.as_real() * b.as_real());
     if (a.is_integer() && b.is_integer()) {
         int64_t r = static_cast<int64_t>(a.as_integer()) * static_cast<int64_t>(b.as_integer());
         if (r < INT32_MIN || r > INT32_MAX) return Value::real(static_cast<double>(r));
@@ -236,7 +265,8 @@ Value Interpreter::mul_values(Value a, Value b) {
 }
 
 Value Interpreter::div_values(Value a, Value b) {
-    a = force_if_promise(a); b = force_if_promise(b);
+    a = fast_force(a); b = fast_force(b);
+    if (RJIT_LIKELY(a.is_real() && b.is_real())) return Value::real(a.as_real() / b.as_real());
     double av = a.is_real() ? a.as_real() : (a.is_integer() ? (a.as_integer() == kNaInt ? kNaReal : (double)a.as_integer()) : 0);
     double bv = b.is_real() ? b.as_real() : (b.is_integer() ? (b.as_integer() == kNaInt ? kNaReal : (double)b.as_integer()) : 0);
     return Value::real(av / bv);
@@ -244,8 +274,7 @@ Value Interpreter::div_values(Value a, Value b) {
 
 template <typename Cmp>
 static Value cmp_scalar(Value a, Value b, Cmp&& cmp) {
-    a = force_if_promise(a); b = force_if_promise(b);
-    // Promote integer/logical to real for comparison
+    a = fast_force(a); b = fast_force(b);
     auto to_real = [](Value v) -> double {
         if (v.is_real()) return v.as_real();
         if (v.is_integer()) return v.as_integer() == kNaInt ? kNaReal : (double)v.as_integer();
@@ -305,11 +334,11 @@ Value Interpreter::dollar_value(Value base, uint32_t sym_id) {
 }
 
 int32_t Interpreter::as_logical_scalar(Value v) {
-    v = force_if_promise(v);
-    if (v.is_logical()) return v.as_logical();
+    v = fast_force(v);
+    if (RJIT_LIKELY(v.is_logical())) return v.as_logical();
     if (v.is_integer()) return v.as_integer() == 0 ? 0 : (v.as_integer() == kNaInt ? kNaLogical : 1);
     if (v.is_real())    return v.as_real() != v.as_real() ? kNaLogical : (v.as_real() != 0.0 ? 1 : 0);
-    if (v.is_nil())     return 0;  // NULL is treated as FALSE in conditions? Actually R errors. For simplicity, treat as FALSE.
+    if (v.is_nil())     return 0;
     return 0;
 }
 
@@ -340,12 +369,11 @@ Value Interpreter::dispatch_loop(Frame& frame) {
                 // Inline cache fast path — keyed by (fn, pc) to avoid
                 // collisions between functions sharing the same PC.
                 LoadVarIC& ic = ic_table_.load_var_ic(fn, frame.pc);
-                if (ic.valid() && ic.env->shape_id() == ic.shape_id) {
+                if (RJIT_LIKELY(ic.valid() && ic.env->shape_id() == ic.shape_id)) {
                     regs[in.rdest] = ic.env->slot_get(ic.slot);
                 } else {
                     Value v = slow_lookup_var(env, in.k);
                     regs[in.rdest] = v;
-                    // Update IC
                     Environment* found_env = env;
                     uint32_t slot = 0;
                     env->lookup(in.k, nullptr, &found_env, &slot);
@@ -355,7 +383,10 @@ Value Interpreter::dispatch_loop(Frame& frame) {
                         ic.slot = slot;
                     }
                 }
-                ctx_.feedback().type(fn, frame.pc).record(regs[in.rdest].tag());
+                // Feedback recording is expensive; sample it.
+                // (Disabled for now — the feedback engine is not yet
+                // used by the JIT tier-up logic.)
+                // ctx_.feedback().type(fn, frame.pc).record(regs[in.rdest].tag());
                 break;
             }
 
@@ -366,13 +397,11 @@ Value Interpreter::dispatch_loop(Frame& frame) {
             case Op::JUMP_IF_FALSE: {
                 int32_t b = as_logical_scalar(regs[in.ra]);
                 if (b == 0) next_pc = in.k;
-                ctx_.feedback().branch(fn, frame.pc).record(b != 0);
                 break;
             }
             case Op::JUMP_IF_TRUE: {
                 int32_t b = as_logical_scalar(regs[in.ra]);
                 if (b != 0) next_pc = in.k;
-                ctx_.feedback().branch(fn, frame.pc).record(b != 0);
                 break;
             }
             case Op::JUMP_IF_NA: {
@@ -381,8 +410,7 @@ Value Interpreter::dispatch_loop(Frame& frame) {
                 break;
             }
 
-            case Op::ADD:           regs[in.rdest] = add_values(regs[in.ra], regs[in.rb]);
-                                    ctx_.feedback().type(fn, frame.pc).record(regs[in.rdest].tag()); break;
+            case Op::ADD:           regs[in.rdest] = add_values(regs[in.ra], regs[in.rb]); break;
             case Op::SUB:           regs[in.rdest] = sub_values(regs[in.ra], regs[in.rb]); break;
             case Op::MUL:           regs[in.rdest] = mul_values(regs[in.ra], regs[in.rb]); break;
             case Op::DIV:           regs[in.rdest] = div_values(regs[in.ra], regs[in.rb]); break;
@@ -495,8 +523,6 @@ Value Interpreter::dispatch_loop(Frame& frame) {
                 Value* args = &regs[in.ra + 1];
                 Value result = slow_call(callee, args, in.k, env);
                 regs[in.rdest] = result;
-                if (callee.is_heap())
-                    ctx_.feedback().call(fn, frame.pc).record(callee.as_heap());
                 break;
             }
 

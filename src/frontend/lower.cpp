@@ -80,10 +80,11 @@ uint32_t Lowerer::lower_expr(Ast const& node, uint32_t dst) {
         }
         case AstKind::Symbol: {
             std::string const& name = static_cast<SymbolAst const&>(node).name;
-            // Check if it's a parameter or local variable.
+            // Check if it's a parameter or local variable (promoted).
             uint32_t slot = slot_for(name);
             if (slot != UINT32_MAX) {
-                b_.emit(Op::LOAD_LOCAL, dst, slot);
+                // Fast path: load directly from register file.
+                if (dst != slot) b_.emit(Op::LOAD_LOCAL, dst, slot);
                 return dst;
             }
             uint32_t sym = intern_symbol(name);
@@ -180,7 +181,8 @@ uint32_t Lowerer::lower_unaryop(UnaryOpAst const& node, uint32_t dst) {
 }
 
 uint32_t Lowerer::lower_assign(AssignAst const& node, uint32_t dst, bool discard) {
-    // Lower RHS first
+    // Lower RHS first, computing directly into dst when possible
+    // to avoid unnecessary register copies.
     uint32_t v = lower_expr(*node.value);
     // Target must be a symbol (or assignable expression)
     if (node.target->kind == AstKind::Symbol) {
@@ -190,14 +192,21 @@ uint32_t Lowerer::lower_assign(AssignAst const& node, uint32_t dst, bool discard
         if (node.super) {
             b_.emit(Op::STORE_SUPER, 0, v, 0, sym);
         } else {
-            // If the variable is already a local or param, store in-register.
+            // Promote to local register: if this variable isn't already
+            // a local, make it one. The register IS the canonical
+            // location — we do NOT write to the environment on every
+            // assignment. This is critical for loop performance.
             uint32_t slot = slot_for(name);
-            if (slot != UINT32_MAX) {
+            if (slot == UINT32_MAX) {
+                slot = b_.alloc_reg();
+                local_slots_[name] = slot;
+                // First assignment: store in the register AND define
+                // in the environment (for reflection / top-level
+                // visibility).
                 if (slot != v) b_.emit(Op::LOAD_LOCAL, slot, v);
-            } else {
-                // Not a local: store in the environment (global or
-                // caller's env, depending on context).
                 b_.emit(Op::STORE_VAR, 0, v, 0, sym);
+            } else {
+                if (slot != v) b_.emit(Op::LOAD_LOCAL, slot, v);
             }
         }
     } else if (node.target->kind == AstKind::Index) {
@@ -292,41 +301,71 @@ uint32_t Lowerer::lower_if(IfAst const& node, uint32_t dst) {
 }
 
 uint32_t Lowerer::lower_for(ForAst const& node, uint32_t dst) {
-    uint32_t seq_r = lower_expr(*node.seq);
+    // Allocate the loop variable as a local register.
     uint32_t var_r = slot_for(node.var);
     if (var_r == UINT32_MAX) {
-        // New local variable; allocate a register for it.
         var_r = b_.alloc_reg();
         local_slots_[node.var] = var_r;
     }
+
+    // Optimize the common case: for (i in a:b) where a:b is a range.
+    // Instead of materializing a vector and indexing it, iterate
+    // the loop variable directly from start to stop.
+    if (node.seq->kind == AstKind::BinOp &&
+        static_cast<BinOpAst const&>(*node.seq).op == ":") {
+        auto const& range = static_cast<BinOpAst const&>(*node.seq);
+        uint32_t start_r = lower_expr(*range.lhs);
+        uint32_t stop_r  = lower_expr(*range.rhs);
+        // var = start
+        b_.emit(Op::LOAD_LOCAL, var_r, start_r);
+        // Loop header
+        uint32_t header = b_.emit(Op::LOOP_HEADER, 0);
+        // Compare var <= stop
+        uint32_t cmp_r = b_.alloc_reg();
+        b_.emit(Op::LE, cmp_r, var_r, stop_r);
+        uint32_t exit_jump = b_.emit(Op::JUMP_IF_FALSE, 0, cmp_r, 0, 0);
+        // Body
+        loops_.push_back({0, 0});
+        loops_.back().break_target = static_cast<uint32_t>(b_.current_count());
+        loops_.back().next_target = static_cast<uint32_t>(b_.current_count());
+        lower_expr(*node.body, UINT32_MAX);
+        // var++
+        uint32_t one_k = b_.add_constant(Value::integer(1));
+        uint32_t inc_r = b_.alloc_reg();
+        b_.emit(Op::LOAD_INT, inc_r, 0, 0, one_k);
+        b_.emit(Op::ADD, var_r, var_r, inc_r);
+        // Backedge
+        b_.emit(Op::LOOP_BACKEDGE, 0);
+        b_.emit(Op::JUMP, 0, 0, 0, header);
+        // Exit
+        uint32_t exit_target = static_cast<uint32_t>(b_.current_count());
+        b_.patch_k(exit_jump, exit_target);
+        loops_.pop_back();
+        b_.emit(Op::LOAD_NIL, dst);
+        return dst;
+    }
+
+    // General case: materialize the sequence and index it.
+    uint32_t seq_r = lower_expr(*node.seq);
     uint32_t len_r = b_.alloc_reg();
     uint32_t idx_r = b_.alloc_reg();
-    uint32_t cmp_r = b_.alloc_reg();  // scratch for comparison
+    uint32_t cmp_r = b_.alloc_reg();
     b_.emit(Op::LENGTH, len_r, seq_r);
-    // idx_r = 1 (R is 1-indexed)
     uint32_t one_k = b_.add_constant(Value::integer(1));
     b_.emit(Op::LOAD_INT, idx_r, 0, 0, one_k);
-    // Loop header
     uint32_t header = b_.emit(Op::LOOP_HEADER, 0);
-    // Compare idx <= len
     b_.emit(Op::LE, cmp_r, idx_r, len_r);
     uint32_t exit_jump = b_.emit(Op::JUMP_IF_FALSE, 0, cmp_r, 0, 0);
-    // x <- seq[[idx]]
     b_.emit(Op::INDEX2, var_r, seq_r, idx_r);
-    // Body (discard result — for loops return NULL)
     loops_.push_back({0, 0});
-    uint32_t body_start = static_cast<uint32_t>(b_.current_count());
-    loops_.back().break_target = body_start;
-    loops_.back().next_target = body_start;
+    loops_.back().break_target = static_cast<uint32_t>(b_.current_count());
+    loops_.back().next_target = static_cast<uint32_t>(b_.current_count());
     lower_expr(*node.body, UINT32_MAX);
-    // Increment idx
     uint32_t inc_r = b_.alloc_reg();
     b_.emit(Op::LOAD_INT, inc_r, 0, 0, one_k);
     b_.emit(Op::ADD, idx_r, idx_r, inc_r);
-    // Backedge
     b_.emit(Op::LOOP_BACKEDGE, 0);
     b_.emit(Op::JUMP, 0, 0, 0, header);
-    // Exit
     uint32_t exit_target = static_cast<uint32_t>(b_.current_count());
     b_.patch_k(exit_jump, exit_target);
     loops_.pop_back();

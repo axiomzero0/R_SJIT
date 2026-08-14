@@ -13,6 +13,9 @@
 #include "rjit/vm/interpreter.hpp"
 #include "rjit/jit/baseline.hpp"
 #include "rjit/jit/tier_manager.hpp"
+#include "rjit/ir/sea_of_nodes.hpp"
+#include "rjit/ir/graph_builder.hpp"
+#include "rjit/optimizer/passes.hpp"
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -101,6 +104,14 @@ int run_cli(int argc, char** argv) {
         BytecodeFunction* fn = lower.lower_program(*ast);
         if (opts.dump_bytecode) {
             disassemble(fn);
+            return 0;
+        }
+
+        if (opts.dump_graph) {
+            GraphBuilder gb;
+            Graph* graph = gb.build(fn);
+            run_all_passes(*graph);
+            graph->dump();
             return 0;
         }
 

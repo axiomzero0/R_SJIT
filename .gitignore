@@ -1,0 +1,8 @@
+build/
+third_party/asmjit/
+*.o
+*.a
+*.so
+*.dylib
+compile_commands.json
+.cache/

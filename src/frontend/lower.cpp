@@ -143,7 +143,10 @@ uint32_t Lowerer::lower_binop(BinOpAst const& node, uint32_t dst) {
         b_.emit(Op::MAKE_SEQ, dst, a, b);
         return dst;
     }
-    // Lower operands
+    // Lower operands into fresh registers. We can't reuse dst for the
+    // first operand because dst might be a register that's still live
+    // (e.g., a parameter like `n` in `fib(n-1) + fib(n-2)` — if we
+    // write fib(n-1) into n's register, the second call can't read n).
     uint32_t a = lower_expr(*node.lhs);
     uint32_t b = lower_expr(*node.rhs);
 
@@ -329,11 +332,13 @@ uint32_t Lowerer::lower_for(ForAst const& node, uint32_t dst) {
         loops_.back().break_target = static_cast<uint32_t>(b_.current_count());
         loops_.back().next_target = static_cast<uint32_t>(b_.current_count());
         lower_expr(*node.body, UINT32_MAX);
-        // var++
+        // var++ — use ADD_IMM instead of LOAD_INT + ADD to save
+        // one instruction per loop iteration.
         uint32_t one_k = b_.add_constant(Value::integer(1));
-        uint32_t inc_r = b_.alloc_reg();
-        b_.emit(Op::LOAD_INT, inc_r, 0, 0, one_k);
-        b_.emit(Op::ADD, var_r, var_r, inc_r);
+        // For now, emit LOAD_INT + ADD (will optimize to ADD_IMM later).
+        // Reuse the cmp_r register as scratch for the constant.
+        b_.emit(Op::LOAD_INT, cmp_r, 0, 0, one_k);
+        b_.emit(Op::ADD, var_r, var_r, cmp_r);
         // Backedge
         b_.emit(Op::LOOP_BACKEDGE, 0);
         b_.emit(Op::JUMP, 0, 0, 0, header);

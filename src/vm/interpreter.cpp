@@ -8,6 +8,7 @@
 #include "rjit/core/vector.hpp"
 #include "rjit/core/context.hpp"
 #include "rjit/jit/tier_manager.hpp"
+#include "rjit/jit/baseline.hpp"
 #include "rjit/frontend/ast.hpp"
 #include "rjit/frontend/lower.hpp"
 #include "rjit/bytecode/opcodes.hpp"
@@ -68,7 +69,21 @@ Value Interpreter::execute_with_args(BytecodeFunction* fn, Environment* env, Val
     }
     frame->regs = regs;
     call_stack_.push_back(frame);
-    ctx_.feedback().call_count(fn).fetch_add(1, std::memory_order_relaxed);
+
+    // Tier check: if the call count exceeds the baseline threshold,
+    // try to compile with the baseline JIT.
+    uint64_t count = ctx_.feedback().call_count(fn).fetch_add(1, std::memory_order_relaxed);
+    if (count == FeedbackEngine::kBaselineThreshold &&
+        ctx_.tiers().current_tier(fn) == Tier::kInterpreter) {
+        BaselineJIT jit(ctx_);
+        JitCode* code = jit.compile(fn);
+        if (code) {
+            ctx_.tiers().set_current_tier(fn, Tier::kBaseline);
+            // Store the compiled code for future use.
+            // (A full implementation would cache this in a code cache.)
+        }
+    }
+
     Value result = dispatch_loop(*frame);
     call_stack_.pop_back();
     delete[] regs;
@@ -322,8 +337,9 @@ Value Interpreter::dispatch_loop(Frame& frame) {
             case Op::LOAD_LOCAL:    regs[in.rdest] = regs[in.ra]; break;
 
             case Op::LOAD_VAR: {
-                // Inline cache fast path
-                LoadVarIC& ic = ic_table_.load_var_ic(frame.pc);
+                // Inline cache fast path — keyed by (fn, pc) to avoid
+                // collisions between functions sharing the same PC.
+                LoadVarIC& ic = ic_table_.load_var_ic(fn, frame.pc);
                 if (ic.valid() && ic.env->shape_id() == ic.shape_id) {
                     regs[in.rdest] = ic.env->slot_get(ic.slot);
                 } else {

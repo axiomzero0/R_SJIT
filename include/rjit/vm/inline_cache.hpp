@@ -11,6 +11,7 @@
 #pragma once
 #include <cstdint>
 #include <vector>
+#include <unordered_map>
 #include "rjit/core/value.hpp"
 
 namespace rjit {
@@ -51,19 +52,28 @@ struct CallIC {
 
 class InlineCacheTable {
 public:
-    LoadVarIC& load_var_ic(uint32_t instr_idx) {
-        if (load_var_ics_.size() <= instr_idx)
-            load_var_ics_.resize(instr_idx + 1);
-        return load_var_ics_[instr_idx];
+    // ICs are keyed by (function, instruction index) because different
+    // functions share the same PC space. Using just the PC would cause
+    // cache collisions between functions.
+    LoadVarIC& load_var_ic(BytecodeFunction* fn, uint32_t instr_idx) {
+        auto key = std::make_pair(fn, instr_idx);
+        auto& slot = load_var_ics_[key];
+        return slot;
     }
-    CallIC& call_ic(uint32_t instr_idx) {
-        if (call_ics_.size() <= instr_idx)
-            call_ics_.resize(instr_idx + 1);
-        return call_ics_[instr_idx];
+    CallIC& call_ic(BytecodeFunction* fn, uint32_t instr_idx) {
+        auto key = std::make_pair(fn, instr_idx);
+        auto& slot = call_ics_[key];
+        return slot;
     }
 private:
-    std::vector<LoadVarIC> load_var_ics_;
-    std::vector<CallIC>    call_ics_;
+    using Key = std::pair<BytecodeFunction*, uint32_t>;
+    struct KeyHash {
+        size_t operator()(Key const& k) const noexcept {
+            return reinterpret_cast<uintptr_t>(k.first) ^ (size_t{k.second} << 8);
+        }
+    };
+    std::unordered_map<Key, LoadVarIC, KeyHash> load_var_ics_;
+    std::unordered_map<Key, CallIC, KeyHash>    call_ics_;
 };
 
 }  // namespace rjit

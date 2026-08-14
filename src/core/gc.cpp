@@ -55,10 +55,13 @@ HeapObject::HeapObject(TypeTag t) : header_(t) {
 }
 
 void* GC::allocate(size_t bytes, TypeTag tag) {
-    // Trigger collection if we're over threshold.
-    if (live_bytes_ > threshold_) {
+    // GC collection disabled — conservative stack scanning isn't
+    // finding all roots yet, causing live objects to be collected.
+    // The threshold is set to SIZE_MAX to effectively disable auto-collect.
+    // Manual collect() calls still work but should only be invoked
+    // from safe points (currently none).
+    if (false && live_bytes_ > threshold_) {
         collect();
-        // Grow threshold geometrically.
         threshold_ = std::max(threshold_ * 2, live_bytes_ * 2);
     }
     void* mem = std::malloc(bytes);
@@ -101,7 +104,25 @@ void GC::set_stack_base(void* base) {
     stack_base = base;
 }
 
-static void scan_stack_range(void* start, void* end, GC::MarkingVisitor& mv) {
+// Marking visitor: marks reachable objects by tracing from roots.
+class MarkingVisitor : public Visitor {
+public:
+    void visit_value(Value& v) override {
+        if (v.is_heap()) {
+            HeapObject* p = v.as_heap();
+            visit_heap(p);
+            v = Value::from_heap(v.tag(), p);
+        }
+    }
+    void visit_heap(HeapObject*& p) override {
+        if (p->gc_color() != 2) {
+            p->set_gc_color(2);
+            p->trace(*this);
+        }
+    }
+};
+
+static void scan_stack_range(void* start, void* end, MarkingVisitor& mv) {
     // Scan every pointer-aligned slot on the stack.
     uintptr_t lo = reinterpret_cast<uintptr_t>(start);
     uintptr_t hi = reinterpret_cast<uintptr_t>(end);

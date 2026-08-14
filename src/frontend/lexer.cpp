@@ -99,7 +99,35 @@ void Lexer::skip_whitespace_and_comments() noexcept {
         if (c == ' ' || c == '\t' || c == '\r') {
             advance();
         } else if (c == '#') {
-            while (pos_ < src_.size() && src_[pos_] != '\n') advance();
+            // Check for #! directive (test runner metadata)
+            if (pos_ + 1 < src_.size() && src_[pos_ + 1] == '!') {
+                // Check if it's #!expect or #!expect_error
+                bool is_expect = (pos_ + 7 < src_.size() &&
+                                  src_[pos_+2] == 'e' && src_[pos_+3] == 'x' &&
+                                  src_[pos_+4] == 'p' && src_[pos_+5] == 'e' &&
+                                  src_[pos_+6] == 'c' && src_[pos_+7] == 't');
+                // Skip the #! line
+                while (pos_ < src_.size() && src_[pos_] != '\n') advance();
+                if (pos_ < src_.size()) advance(); // skip the newline
+
+                if (is_expect) {
+                    // Skip everything until #!end
+                    while (pos_ < src_.size()) {
+                        // Check for #!end
+                        if (src_[pos_] == '#' && pos_ + 5 < src_.size() &&
+                            src_[pos_+1] == '!' && src_[pos_+2] == 'e' &&
+                            src_[pos_+3] == 'n' && src_[pos_+4] == 'd') {
+                            while (pos_ < src_.size() && src_[pos_] != '\n') advance();
+                            if (pos_ < src_.size()) advance();
+                            break;
+                        }
+                        advance();
+                    }
+                }
+            } else {
+                // Regular comment: skip to end of line
+                while (pos_ < src_.size() && src_[pos_] != '\n') advance();
+            }
         } else {
             break;
         }

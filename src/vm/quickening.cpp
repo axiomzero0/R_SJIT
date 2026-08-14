@@ -68,7 +68,7 @@ Op quicken_observe(Instr& in, TypeTag ta, TypeTag tb) {
         }
     }
 
-    counter = std::min(counter + 1, static_cast<uint16_t>(15));
+    counter = std::min(static_cast<uint16_t>(counter + 1), static_cast<uint16_t>(15));
     flags = set_counter(flags, counter);
 
     // If we've seen consistent types enough times, rewrite.

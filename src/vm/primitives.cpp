@@ -22,7 +22,20 @@ Value print_impl(Context& ctx, Value* args, uint32_t nargs) {
         else if (v.is_logical()) std::printf("[1] %s\n", v.as_logical() == 1 ? "TRUE" : (v.as_logical() == 0 ? "FALSE" : "NA"));
         else if (v.is_nil()) std::printf("NULL\n");
         else if (v.is_string()) {
-            std::printf("[1] \"%s\"\n", std::string(ctx.symbol_name(v.as_string())).c_str());
+            // R-style string printing with escape sequences
+            std::string s(ctx.symbol_name(v.as_string()));
+            std::printf("[1] \"");
+            for (char c : s) {
+                switch (c) {
+                    case '\\': std::printf("\\\\"); break;
+                    case '"':  std::printf("\\\""); break;
+                    case '\n': std::printf("\\n"); break;
+                    case '\t': std::printf("\\t"); break;
+                    case '\r': std::printf("\\r"); break;
+                    default: std::printf("%c", c);
+                }
+            }
+            std::printf("\"\n");
         } else if (v.is_vector()) {
             Vector* vec = v.as_vector();
             if (vec->vtype() == VectorType::kReal) {

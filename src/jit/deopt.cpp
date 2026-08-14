@@ -100,23 +100,8 @@ Frame* DeoptContext::materialize(uint32_t safepoint_id, Value* input_values, uin
 // The safepoint_id identifies which deopt blob to use.
 // input_values are the Values that were in JIT registers at the
 // deopt point (passed by the JIT code).
-extern "C" void rjit_helper_deopt(uint32_t safepoint_id, Value* input_values, uint32_t n_inputs) {
-    DeoptContext& dc = current_context().deopt();
-    Frame* frame = dc.materialize(safepoint_id, input_values, n_inputs);
-    if (!frame) {
-        current_context().raise_error("deopt: invalid safepoint id");
-    }
-    // Transfer control to the interpreter.
-    // In a full implementation, this would longjmp to the interpreter
-    // loop with the materialized frame. For now, we execute the frame
-    // directly.
-    Value result = current_context().interpreter().dispatch_loop(*frame);
-    (void)result;
-    // The interpreter will continue from the deopt point.
-    // When it returns, we need to restore the JIT call stack.
-    // This is a simplification — a full implementation would use
-    // setjmp/longjmp or a C++ exception to unwind.
-    current_context().raise_error("deopt: materialized frame execution not yet supported");
-}
+// Note: the actual rjit_helper_deopt is defined in baseline.cpp;
+// this file provides the DeoptContext implementation.
+
 
 }  // namespace rjit

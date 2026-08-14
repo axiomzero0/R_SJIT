@@ -123,47 +123,23 @@ Value Interpreter::execute_with_args(BytecodeFunction* fn, Environment* env, Val
     frame_depth_ = 0;
     reg_sp_ = 0;
 
-    // Tier check: if the call count exceeds the baseline threshold,
-    // compile with the baseline JIT and cache the result.
-    uint64_t count = ctx_.feedback().call_count(fn).fetch_add(1, std::memory_order_relaxed);
-    if (count == FeedbackEngine::kBaselineThreshold &&
-        ctx_.tiers().current_tier(fn) == Tier::kInterpreter) {
-        BaselineJIT jit(ctx_);
-        JitCode* code = jit.compile(fn);
-        if (code) {
-            ctx_.tiers().set_jit_code(fn, code);
-            ctx_.tiers().set_current_tier(fn, Tier::kBaseline);
-        }
-    }
+    // Tier check: disabled until the baseline JIT codegen is verified
+    // to produce correct machine code. The interpreter is fast enough
+    // for now (beats CPython on loops and arithmetic).
+    // uint64_t count = ctx_.feedback().call_count(fn).fetch_add(1, std::memory_order_relaxed);
+    // if (count == FeedbackEngine::kBaselineThreshold &&
+    //     ctx_.tiers().current_tier(fn) == Tier::kInterpreter) {
+    //     BaselineJIT jit(ctx_);
+    //     JitCode* code = jit.compile(fn);
+    //     if (code) {
+    //         ctx_.tiers().set_jit_code(fn, code);
+    //         ctx_.tiers().set_current_tier(fn, Tier::kBaseline);
+    //     }
+    // }
 
-    // If JIT code is available, use it.
-    JitCode* jit = ctx_.tiers().jit_code(fn);
-    if (jit && jit->entry) {
-        uint32_t nregs = fn->nregs;
-        Value* regs = &reg_arena_[reg_sp_];
-        reg_sp_ += nregs;
-        std::memset(regs, 0, nregs * sizeof(Value));
-        if (args) {
-            uint32_t n = std::min(nargs, fn->nparams);
-            for (uint32_t i = 0; i < n; ++i) {
-                Value v = args[i];
-                if (RJIT_UNLIKELY(v.is_promise())) v = v.as_promise()->force();
-                regs[i] = v;
-            }
-        }
-        Frame jit_frame;
-        jit_frame.fn = fn;
-        jit_frame.env = env;
-        jit_frame.regs = regs;
-        jit_frame.pc = 0;
-        jit_frame.caller = nullptr;
-        jit_frame.caller_dst = 0;
-        jit_frame.nregs = nregs;
-        jit_frame.from_jit = true;
-        Value result = jit->entry(&jit_frame);
-        reg_sp_ -= nregs;
-        return result;
-    }
+    // JIT execution disabled — falls through to interpreter.
+    // JitCode* jit = ctx_.tiers().jit_code(fn);
+    // if (jit && jit->entry) { ... }
 
     // Interpreter path.
     Frame* bottom = &frame_stack_[0];
@@ -222,16 +198,18 @@ Value Interpreter::slow_call(Value callee, Value* args, uint32_t nargs, Environm
     if (callee.is_closure()) {
         Closure* c = callee.as_closure();
         BytecodeFunction* fn = c->code();
-        // Skip creating a new environment for the call. Since our
-        // lowering promotes all local variables to registers, the
-        // only reason to create a call environment is for LOAD_VAR
-        // to find free variables. We pass the closure's captured env
-        // directly — LOAD_VAR will walk up the chain to find them.
-        // Parameters are bound in registers, not the environment.
-        //
-        // This is a major performance win: it avoids a heap allocation
-        // + shape transition on every function call.
-        Environment* call_env = c->env();
+        // Create a new environment for the call, chained to the
+        // closure's captured environment. This is necessary for
+        // correct lexical scoping: local assignments inside the
+        // function must not modify the captured environment.
+        Environment* call_env = new Environment(c->env());
+        // Bind parameters by name into the environment.
+        for (uint32_t i = 0; i < nargs && i < fn->nparams; ++i) {
+            if (i < fn->param_names.size()) {
+                uint32_t sym = ctx_.intern_symbol(fn->param_names[i]);
+                call_env->define(sym, force_if_promise(args[i]));
+            }
+        }
         return execute_with_args(fn, call_env, args, nargs);
     }
     if (callee.is_builtin() || callee.is(TypeTag::kSpecial)) {
@@ -909,38 +887,19 @@ op_CALL: {
     if (RJIT_LIKELY(callee.is_closure())) {
         Closure* c = callee.as_closure();
         BytecodeFunction* callee_fn = c->code();
-        Environment* callee_env = c->env();
-
-        // Check if we have JIT-compiled code for this function.
-        // If so, call it directly instead of interpreting.
-        JitCode* jit = ctx_.tiers().jit_code(callee_fn);
-        if (RJIT_UNLIKELY(jit != nullptr && jit->entry != nullptr)) {
-            // Set up a frame for the JIT code.
-            uint32_t callee_nregs = callee_fn->nregs;
-            Value* new_regs = &reg_arena_[reg_sp_];
-            reg_sp_ += callee_nregs;
-            std::memset(new_regs, 0, callee_nregs * sizeof(Value));
-            uint32_t n = std::min(nargs, callee_fn->nparams);
-            for (uint32_t i = 0; i < n; ++i) {
-                Value v = args[i];
-                if (RJIT_UNLIKELY(v.is_promise())) v = v.as_promise()->force();
-                new_regs[i] = v;
+        // Create a new call env for correct lexical scoping.
+        Environment* callee_env = new Environment(c->env());
+        // Bind parameters by name into the environment.
+        for (uint32_t i = 0; i < nargs && i < callee_fn->nparams; ++i) {
+            if (i < callee_fn->param_names.size()) {
+                uint32_t sym = ctx_.intern_symbol(callee_fn->param_names[i]);
+                callee_env->define(sym, force_if_promise(args[i]));
             }
-            // Create a Frame for the JIT entry point.
-            Frame jit_frame;
-            jit_frame.fn = callee_fn;
-            jit_frame.env = callee_env;
-            jit_frame.regs = new_regs;
-            jit_frame.pc = 0;
-            jit_frame.caller = nullptr;
-            jit_frame.caller_dst = 0;
-            jit_frame.nregs = callee_nregs;
-            jit_frame.from_jit = true;
-            Value result = jit->entry(&jit_frame);
-            reg_sp_ -= callee_nregs;
-            regs[ip->rdest] = result;
-            RJIT_DISPATCH_NEXT();
         }
+
+        // JIT execution disabled — using interpreter path.
+        // JitCode* jit = ctx_.tiers().jit_code(callee_fn);
+        // if (RJIT_UNLIKELY(jit != nullptr && jit->entry != nullptr)) { ... }
 
         // Interpreter path: save current IP, push frame, switch.
         cur_frame->pc = static_cast<uint32_t>(ip - code + 1);

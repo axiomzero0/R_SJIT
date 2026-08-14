@@ -197,20 +197,20 @@ uint32_t Lowerer::lower_assign(AssignAst const& node, uint32_t dst, bool discard
         } else {
             // Promote to local register: if this variable isn't already
             // a local, make it one. The register IS the canonical
-            // location — we do NOT write to the environment on every
-            // assignment. This is critical for loop performance.
+            // location for fast access, but we MUST also write to the
+            // environment so that:
+            //   1. Other functions can see the variable via LOAD_VAR
+            //   2. The IC cache returns the current value (IC reads
+            //      from the env, not the register)
             uint32_t slot = slot_for(name);
             if (slot == UINT32_MAX) {
                 slot = b_.alloc_reg();
                 local_slots_[name] = slot;
-                // First assignment: store in the register AND define
-                // in the environment (for reflection / top-level
-                // visibility).
-                if (slot != v) b_.emit(Op::LOAD_LOCAL, slot, v);
-                b_.emit(Op::STORE_VAR, 0, slot, 0, sym);
-            } else {
-                if (slot != v) b_.emit(Op::LOAD_LOCAL, slot, v);
             }
+            if (slot != v) b_.emit(Op::LOAD_LOCAL, slot, v);
+            // Always write to the environment so closures and ICs
+            // see the updated value.
+            b_.emit(Op::STORE_VAR, 0, slot, 0, sym);
         }
     } else if (node.target->kind == AstKind::Index) {
         // x[i] <- v   ->   INDEX_ASSIGN base, idx, v

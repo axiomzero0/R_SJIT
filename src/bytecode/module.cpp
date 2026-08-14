@@ -56,6 +56,13 @@ BytecodeFunction* BytecodeBuilder::finalize(std::string name, uint32_t nparams, 
         Instr h; h.op = Op::HALT;
         fn_->code.push_back(h);
     }
+    // Pre-allocate inline cache arrays so the interpreter never
+    // needs to resize them during execution (which would invalidate
+    // any cached pointers).
+    size_t code_size = fn_->code.size();
+    fn_->ic_envs.resize(code_size, nullptr);
+    fn_->ic_shapes.resize(code_size, 0);
+    fn_->ic_slots.resize(code_size, 0);
     return fn_;
 }
 

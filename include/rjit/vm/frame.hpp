@@ -29,11 +29,11 @@ public:
     BytecodeFunction* fn           = nullptr;
     Environment*      env          = nullptr;
     Value*            regs         = nullptr;
-    uint32_t          pc           = 0;
+    uint32_t          pc           = 0;  // saved PC when this frame is suspended
     Frame*            caller       = nullptr;
-    uint32_t          caller_pc    = 0;
-    uint32_t          caller_dst   = 0;  // register in caller that receives our return value
-    bool              from_jit     = false;  // true if this frame was created by JIT code
+    uint32_t          caller_dst   = 0;  // register in caller that receives return value
+    uint32_t          nregs        = 0;  // size of regs array (for freeing)
+    bool              from_jit     = false;
 
     Frame() = default;
 
@@ -43,7 +43,6 @@ public:
         pc = 0;
         this->caller = caller;
         from_jit = false;
-        // regs is allocated externally; we don't own it.
     }
 
     Instr const& instr() const;

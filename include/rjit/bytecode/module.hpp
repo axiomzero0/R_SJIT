@@ -17,6 +17,8 @@
 #include "rjit/core/value.hpp"
 #include "rjit/core/gc.hpp"
 
+namespace rjit { class Environment; }
+
 namespace rjit {
 
 class Environment;
@@ -58,6 +60,17 @@ public:
 
     // Parameter names (for binding arguments at call time).
     std::vector<std::string> param_names;
+
+    // Inline cache storage: one entry per instruction index.
+    // Allocated lazily on first LOAD_VAR/STORE_VAR.
+    // This avoids unordered_map overhead in the hot path.
+    // Each entry is: {env_pointer, shape_id, slot}
+    // Using a flat array indexed by PC gives O(1) lookup with no hashing.
+    mutable std::vector<Environment*> ic_envs;
+    mutable std::vector<uint32_t>     ic_shapes;
+    mutable std::vector<uint32_t>     ic_slots;
+    // Bit i = 1 means instruction i has a valid IC entry.
+    mutable std::vector<uint64_t>     ic_valid;  // bitmap
 
     // Source-level name (for backtraces). May be empty.
     std::string name;

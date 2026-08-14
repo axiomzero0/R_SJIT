@@ -207,7 +207,7 @@ uint32_t Lowerer::lower_assign(AssignAst const& node, uint32_t dst, bool discard
                 // in the environment (for reflection / top-level
                 // visibility).
                 if (slot != v) b_.emit(Op::LOAD_LOCAL, slot, v);
-                b_.emit(Op::STORE_VAR, 0, v, 0, sym);
+                b_.emit(Op::STORE_VAR, 0, slot, 0, sym);
             } else {
                 if (slot != v) b_.emit(Op::LOAD_LOCAL, slot, v);
             }
